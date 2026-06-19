@@ -23,7 +23,7 @@ st.set_page_config(
 )
 
 BASE = Path(__file__).resolve().parent
-PROJECT_ROOT = BASE.parent
+PROJECT_ROOT = BASE
 MODEL_DIR = BASE / "Classification-based Anomaly Detection"
 MODEL_PATH = PROJECT_ROOT / "plant_disease_model.keras"
 FALLBACK_H5_MODEL_PATH = MODEL_DIR / "plant_disease_model_tf.h5"
@@ -93,26 +93,120 @@ PLANT_ALIASES = {
 }
 
 
+class AppError(Exception):
+    def __init__(self, code, message, *, detail=None, status="error"):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.detail = detail
+        self.status = status
+
+    def to_dict(self):
+        payload = {
+            "status": self.status,
+            "code": self.code,
+            "message": self.message,
+        }
+        if self.detail:
+            payload["detail"] = self.detail
+        return payload
+
+
+def format_error(exc):
+    if isinstance(exc, AppError):
+        return exc.to_dict()
+    return {
+        "status": "error",
+        "code": "UNEXPECTED_ERROR",
+        "message": "Prediction failed because of an unexpected server error.",
+        "detail": str(exc),
+    }
+
+
+def show_structured_error(exc):
+    payload = format_error(exc)
+    st.error(payload["message"])
+    st.json(payload)
+
+
+def effective_classes_for_model(model):
+    try:
+        output_count = int(model.output_shape[-1])
+    except Exception as exc:
+        raise AppError(
+            "MODEL_OUTPUT_SHAPE_INVALID",
+            "The loaded model has an unsupported output shape.",
+            detail={"output_shape": str(getattr(model, "output_shape", None)), "error": str(exc)},
+        )
+
+    if len(CLASSES) == output_count:
+        return CLASSES
+
+    classes_without_background = [label for label in CLASSES if label != BACKGROUND_CLASS]
+    if len(classes_without_background) == output_count:
+        return classes_without_background
+
+    raise AppError(
+        "CLASS_COUNT_MISMATCH",
+        "The class list does not match the loaded model output count.",
+        detail={
+            "class_count": len(CLASSES),
+            "class_count_without_background": len(classes_without_background),
+            "model_output_count": output_count,
+            "fix": "Regenerate model_metadata.json or update DEFAULT_CLASSES to match the training folder order.",
+        },
+    )
+
+
 @st.cache_resource(show_spinner=False)
 def load_tf_model():
     if not TF_AVAILABLE:
-        return None, "TensorFlow is not installed in this environment."
+        return None, {
+            "code": "TENSORFLOW_UNAVAILABLE",
+            "message": "TensorFlow is not installed in this environment.",
+        }
 
     try:
         import tensorflow as tf
     except Exception as exc:
-        return None, f"TensorFlow could not be imported: {exc}"
+        return None, {
+            "code": "TENSORFLOW_IMPORT_FAILED",
+            "message": "TensorFlow could not be imported.",
+            "detail": str(exc),
+        }
 
     model_candidates = [MODEL_PATH, FALLBACK_KERAS_MODEL_PATH, FALLBACK_H5_MODEL_PATH]
     model_file = next((path for path in model_candidates if path.exists()), None)
     if model_file is None:
-        searched = ", ".join(str(path) for path in model_candidates)
-        return None, f"No trained TensorFlow/Keras model found. Searched: {searched}"
+        return None, {
+            "code": "MODEL_NOT_FOUND",
+            "message": "No trained TensorFlow/Keras model found.",
+            "detail": {
+                "searched": [str(path) for path in model_candidates],
+                "expected_primary_model": str(MODEL_PATH),
+            },
+        }
 
     try:
-        return tf.keras.models.load_model(model_file), None
+        model = tf.keras.models.load_model(model_file)
+        return {
+            "model": model,
+            "path": model_file,
+            "input_shape": getattr(model, "input_shape", None),
+            "output_shape": getattr(model, "output_shape", None),
+        }, None
     except Exception as exc:
-        return None, f"Could not load TensorFlow model: {exc}"
+        return None, {
+            "code": "MODEL_LOAD_FAILED",
+            "message": "Could not load the TensorFlow/Keras model.",
+            "detail": {
+                "model_path": str(model_file),
+                "error": str(exc),
+            },
+        }
+
+
+MODEL_STATE, MODEL_STARTUP_ERROR = load_tf_model()
 
 
 def crop_center(image, margin=0.08):
@@ -150,6 +244,12 @@ def preprocess_view(image, target_size=IMAGE_SIZE):
 
 
 def preprocess_image(image, target_size=IMAGE_SIZE):
+    if image is None:
+        raise AppError(
+            "IMAGE_REQUIRED",
+            "Upload a plant leaf image before running prediction.",
+        )
+
     image = image.convert("RGB")
     views = [
         image,
@@ -193,44 +293,73 @@ def infer_plant_from_filename(filename):
 
 
 def predict_disease(image, selected_plant=None):
-    model, error = load_tf_model()
-    if error:
-        raise RuntimeError(error)
-
-    if len(CLASSES) != int(model.output_shape[-1]):
-        raise RuntimeError(
-            f"Class list has {len(CLASSES)} labels, but the model outputs {int(model.output_shape[-1])} scores. "
-            "Regenerate model_metadata.json or fix DEFAULT_CLASSES to match the training folder order."
+    if MODEL_STARTUP_ERROR:
+        raise AppError(
+            MODEL_STARTUP_ERROR["code"],
+            MODEL_STARTUP_ERROR["message"],
+            detail=MODEL_STARTUP_ERROR.get("detail"),
         )
+
+    if not MODEL_STATE or MODEL_STATE.get("model") is None:
+        raise AppError(
+            "MODEL_NOT_READY",
+            "The trained model is not loaded in server memory.",
+        )
+
+    model = MODEL_STATE["model"]
+
+    model_classes = effective_classes_for_model(model)
 
     if hasattr(model, "input_shape") and len(model.input_shape) >= 3:
         target_size = tuple(int(dim) for dim in model.input_shape[1:3])
     else:
         target_size = IMAGE_SIZE
-    
-    probs = model.predict(preprocess_image(image, target_size), verbose=0).mean(axis=0)
+
+    try:
+        batch = preprocess_image(image, target_size)
+        probs = model.predict(batch, verbose=0).mean(axis=0)
+    except AppError:
+        raise
+    except Exception as exc:
+        raise AppError(
+            "INFERENCE_FAILED",
+            "The model could not process this image.",
+            detail={"error": str(exc), "target_size": list(target_size)},
+        )
+
+    if probs.ndim != 1 or probs.shape[0] != len(model_classes):
+        raise AppError(
+            "PREDICTION_SHAPE_INVALID",
+            "The model returned predictions in an unexpected shape.",
+            detail={"prediction_shape": list(probs.shape), "expected_scores": len(model_classes)},
+        )
+
     display_probs = probs.copy()
-    background_idx = CLASSES.index(BACKGROUND_CLASS) if BACKGROUND_CLASS in CLASSES else None
+    background_idx = model_classes.index(BACKGROUND_CLASS) if BACKGROUND_CLASS in model_classes else None
     if background_idx is not None:
         display_probs[background_idx] = 0.0
 
     if selected_plant:
         selected_key = selected_plant.lower().replace(" ", "").replace(",", "")
-        for idx, label in enumerate(CLASSES):
+        for idx, label in enumerate(model_classes):
             if label == BACKGROUND_CLASS or plant_key(label) != selected_key:
                 display_probs[idx] = 0.0
 
     disease_total = float(display_probs.sum())
     if disease_total <= 0:
         plant_message = f" for {selected_plant}" if selected_plant else ""
-        raise RuntimeError(f"The model did not return any usable disease scores{plant_message}.")
+        raise AppError(
+            "NO_USABLE_DISEASE_SCORE",
+            f"The model did not return any usable disease scores{plant_message}.",
+            detail={"selected_plant": selected_plant or "Auto"},
+        )
 
     display_probs = display_probs / disease_total
     top_indices = [
         idx for idx in np.argsort(display_probs)[::-1]
-        if CLASSES[int(idx)] != BACKGROUND_CLASS
+        if model_classes[int(idx)] != BACKGROUND_CLASS
     ][:5]
-    return [(CLASSES[int(i)], float(display_probs[int(i)])) for i in top_indices]
+    return [(model_classes[int(i)], float(display_probs[int(i)])) for i in top_indices]
 
 
 def google_image_search(query_or_url):
@@ -596,7 +725,7 @@ with tab_detect:
 
         if analyze:
             if image is None:
-                st.warning("Upload an image before running prediction.")
+                show_structured_error(AppError("IMAGE_REQUIRED", "Upload an image before running prediction."))
             else:
                 try:
                     with st.spinner("Running TensorFlow inference..."):
@@ -621,7 +750,7 @@ with tab_detect:
                         st.progress(conf, text=f"{plant_name} - {condition_name}: {conf * 100:.2f}%")
 
                 except Exception as exc:
-                    st.error(str(exc))
+                    show_structured_error(exc)
         else:
             st.info("Upload a leaf and run prediction to see live results here.")
 
@@ -631,15 +760,13 @@ with tab_system:
     model_candidates = [MODEL_PATH, FALLBACK_KERAS_MODEL_PATH, FALLBACK_H5_MODEL_PATH]
     model_source = next((path for path in model_candidates if path.exists()), MODEL_PATH)
 
-    if not TF_AVAILABLE:
-        system_message = "TensorFlow is not installed in this environment."
-        system_ok = False
-    elif not model_source.exists():
-        searched = ", ".join(str(path) for path in model_candidates)
-        system_message = f"No trained TensorFlow/Keras model found. Searched: {searched}"
+    if MODEL_STARTUP_ERROR:
+        system_message = f'{MODEL_STARTUP_ERROR["message"]}'
+        if MODEL_STARTUP_ERROR.get("detail"):
+            system_message = f"{system_message} Details: {MODEL_STARTUP_ERROR['detail']}"
         system_ok = False
     else:
-        system_message = f"Model file linked: {model_source}. It will load when you run prediction."
+        system_message = f"Model loaded in server memory: {MODEL_STATE['path']}"
         system_ok = True
 
     c1, c2, c3 = st.columns(3)
