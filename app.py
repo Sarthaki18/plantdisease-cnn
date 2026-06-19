@@ -439,9 +439,16 @@ h1, h2, h3, h4, h5, h6, p, label, span {
 
 .hero h1 {
     color:white !important;
+    -webkit-text-fill-color:white !important;
     font-size:clamp(2.4rem, 5vw, 5rem);
     line-height:.95;
     margin:0 0 10px;
+}
+
+.hero-title {
+    color:white !important;
+    -webkit-text-fill-color:white !important;
+    text-shadow:0 2px 14px rgba(0,0,0,.38);
 }
 
 .hero p {
@@ -678,7 +685,7 @@ st.markdown("""
 <div class="hero">
     <div>
         <div class="badge">TensorFlow fine-tuned disease classification</div>
-        <h1>LeafScan</h1>
+        <h1 class="hero-title" style="color:#ffffff !important; -webkit-text-fill-color:#ffffff !important;">LeafScan</h1>
         <p>Upload a plant leaf image, run the trained Keras model, and review disease predictions with confidence scores.</p>
     </div>
 </div>
